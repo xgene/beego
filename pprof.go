@@ -9,7 +9,7 @@ type ProfController struct {
 }
 
 func (this *ProfController) Get() {
-	switch this.Ctx.Params[":pp"] {
+	switch this.Ctx.Params.Get("pp") {
 	default:
 		pprof.Index(this.Ctx.ResponseWriter, this.Ctx.Request)
 	case "":

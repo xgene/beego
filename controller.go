@@ -2,26 +2,32 @@ package beego
 
 import (
 	"bytes"
+	"compress/gzip"
+	"compress/zlib"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"github.com/astaxie/beego/session"
 	"html/template"
+	"io"
 	"io/ioutil"
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"strconv"
 	"strings"
 )
 
 type Controller struct {
-	Ctx       *Context
-	Data      map[interface{}]interface{}
-	ChildName string
-	TplNames  string
-	Layout    string
-	TplExt    string
+	Ctx        *Context
+	Data       map[interface{}]interface{}
+	ChildName  string
+	TplNames   string
+	Layout     string
+	TplExt     string
+	CruSession session.SessionStore
 }
 
 type ControllerInterface interface {
@@ -53,6 +59,13 @@ func (c *Controller) Prepare() {
 }
 
 func (c *Controller) Finish() {
+
+}
+
+func (c *Controller) Destructor() {
+	if c.CruSession != nil {
+		c.CruSession.SessionRelease()
+	}
 }
 
 func (c *Controller) Get() {
@@ -89,9 +102,39 @@ func (c *Controller) Render() error {
 	if err != nil {
 		return err
 	} else {
-		c.Ctx.SetHeader("Content-Length", strconv.Itoa(len(rb)), true)
-		c.Ctx.ContentType("text/html")
-		c.Ctx.ResponseWriter.Write(rb)
+		c.Ctx.ResponseWriter.Header().Set("Content-Type", "text/html; charset=utf-8")
+		output_writer := c.Ctx.ResponseWriter.(io.Writer)
+		if EnableGzip == true && c.Ctx.Request.Header.Get("Accept-Encoding") != "" {
+			splitted := strings.SplitN(c.Ctx.Request.Header.Get("Accept-Encoding"), ",", -1)
+			encodings := make([]string, len(splitted))
+
+			for i, val := range splitted {
+				encodings[i] = strings.TrimSpace(val)
+			}
+			for _, val := range encodings {
+				if val == "gzip" {
+					c.Ctx.ResponseWriter.Header().Set("Content-Encoding", "gzip")
+					output_writer, _ = gzip.NewWriterLevel(c.Ctx.ResponseWriter, gzip.BestSpeed)
+
+					break
+				} else if val == "deflate" {
+					c.Ctx.ResponseWriter.Header().Set("Content-Encoding", "deflate")
+					output_writer, _ = zlib.NewWriterLevel(c.Ctx.ResponseWriter, zlib.BestSpeed)
+					break
+				}
+			}
+		} else {
+			c.Ctx.SetHeader("Content-Length", strconv.Itoa(len(rb)), true)
+		}
+		output_writer.Write(rb)
+		switch output_writer.(type) {
+		case *gzip.Writer:
+			output_writer.(*gzip.Writer).Close()
+		case *zlib.Writer:
+			output_writer.(*zlib.Writer).Close()
+		case io.WriteCloser:
+			output_writer.(io.WriteCloser).Close()
+		}
 		return nil
 	}
 	return nil
@@ -114,9 +157,14 @@ func (c *Controller) RenderBytes() ([]byte, error) {
 		subdir := path.Dir(c.TplNames)
 		_, file := path.Split(c.TplNames)
 		newbytes := bytes.NewBufferString("")
+		if _, ok := BeeTemplates[subdir]; !ok {
+			panic("can't find templatefile in the path:" + c.TplNames)
+			return []byte{}, errors.New("can't find templatefile in the path:" + c.TplNames)
+		}
 		BeeTemplates[subdir].ExecuteTemplate(newbytes, file, c.Data)
 		tplcontent, _ := ioutil.ReadAll(newbytes)
 		c.Data["LayoutContent"] = template.HTML(string(tplcontent))
+		subdir = path.Dir(c.Layout)
 		_, file = path.Split(c.Layout)
 		ibytes := bytes.NewBufferString("")
 		err := BeeTemplates[subdir].ExecuteTemplate(ibytes, file, c.Data)
@@ -135,6 +183,10 @@ func (c *Controller) RenderBytes() ([]byte, error) {
 		subdir := path.Dir(c.TplNames)
 		_, file := path.Split(c.TplNames)
 		ibytes := bytes.NewBufferString("")
+		if _, ok := BeeTemplates[subdir]; !ok {
+			panic("can't find templatefile in the path:" + c.TplNames)
+			return []byte{}, errors.New("can't find templatefile in the path:" + c.TplNames)
+		}
 		err := BeeTemplates[subdir].ExecuteTemplate(ibytes, file, c.Data)
 		if err != nil {
 			Trace("template Execute err:", err)
@@ -149,6 +201,10 @@ func (c *Controller) Redirect(url string, code int) {
 	c.Ctx.Redirect(code, url)
 }
 
+func (c *Controller) Abort(code string) {
+	panic(code)
+}
+
 func (c *Controller) ServeJson() {
 	content, err := json.MarshalIndent(c.Data["json"], "", "  ")
 	if err != nil {
@@ -156,7 +212,7 @@ func (c *Controller) ServeJson() {
 		return
 	}
 	c.Ctx.SetHeader("Content-Length", strconv.Itoa(len(content)), true)
-	c.Ctx.ContentType("json")
+	c.Ctx.ResponseWriter.Header().Set("Content-Type", "application/json")
 	c.Ctx.ResponseWriter.Write(content)
 }
 
@@ -167,7 +223,7 @@ func (c *Controller) ServeXml() {
 		return
 	}
 	c.Ctx.SetHeader("Content-Length", strconv.Itoa(len(content)), true)
-	c.Ctx.ContentType("xml")
+	c.Ctx.ResponseWriter.Header().Set("Content-Type", "application/xml")
 	c.Ctx.ResponseWriter.Write(content)
 }
 
@@ -197,25 +253,45 @@ func (c *Controller) GetFile(key string) (multipart.File, *multipart.FileHeader,
 	return c.Ctx.Request.FormFile(key)
 }
 
-func (c *Controller) StartSession() (sess session.SessionStore) {
-	sess = GlobalSessions.SessionStart(c.Ctx.ResponseWriter, c.Ctx.Request)
-	return
+func (c *Controller) SaveToFile(fromfile, tofile string) error {
+	file, _, err := c.Ctx.Request.FormFile(fromfile)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	f, err := os.OpenFile(tofile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	io.Copy(f, file)
+	return nil
 }
 
-func (c *Controller) SetSession(name string, value interface{}) {
-	ss := c.StartSession()
-	defer ss.SessionRelease()
-	ss.Set(name, value)
+func (c *Controller) StartSession() session.SessionStore {
+	if c.CruSession == nil {
+		c.CruSession = GlobalSessions.SessionStart(c.Ctx.ResponseWriter, c.Ctx.Request)
+	}
+	return c.CruSession
 }
 
-func (c *Controller) GetSession(name string) interface{} {
-	ss := c.StartSession()
-	defer ss.SessionRelease()
-	return ss.Get(name)
+func (c *Controller) SetSession(name interface{}, value interface{}) {
+	if c.CruSession == nil {
+		c.StartSession()
+	}
+	c.CruSession.Set(name, value)
 }
 
-func (c *Controller) DelSession(name string) {
-	ss := c.StartSession()
-	defer ss.SessionRelease()
-	ss.Delete(name)
+func (c *Controller) GetSession(name interface{}) interface{} {
+	if c.CruSession == nil {
+		c.StartSession()
+	}
+	return c.CruSession.Get(name)
+}
+
+func (c *Controller) DelSession(name interface{}) {
+	if c.CruSession == nil {
+		c.StartSession()
+	}
+	c.CruSession.Delete(name)
 }

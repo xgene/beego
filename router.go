@@ -1,6 +1,7 @@
 package beego
 
 import (
+	"fmt"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -10,22 +11,19 @@ import (
 )
 
 type controllerInfo struct {
-	pattern        string
-	regex          *regexp.Regexp
-	params         map[int]string
+	pattern string
+	regex   *regexp.Regexp
 	controllerType reflect.Type
 }
 
 type userHandler struct {
 	pattern string
 	regex   *regexp.Regexp
-	params  map[int]string
-	h       http.Handler
+	h http.Handler
 }
 
 type ControllerRegistor struct {
-	routers      []*controllerInfo
-	fixrouters   []*controllerInfo
+	routers []*controllerInfo
 	filters      []http.HandlerFunc
 	userHandlers map[string]*userHandler
 }
@@ -35,123 +33,35 @@ func NewControllerRegistor() *ControllerRegistor {
 }
 
 func (p *ControllerRegistor) Add(pattern string, c ControllerInterface) {
-	parts := strings.Split(pattern, "/")
 
-	j := 0
-	params := make(map[int]string)
-	for i, part := range parts {
-		if strings.HasPrefix(part, ":") {
-			expr := "(.+)"
-			//a user may choose to override the defult expression
-			// similar to expressjs: ‘/user/:id([0-9]+)’ 
-			if index := strings.Index(part, "("); index != -1 {
-				expr = part[index:]
-				part = part[:index]
-				//match /user/:id:int ([0-9]+)
-				//match /post/:username:string	([\w]+)
-			} else if lindex := strings.LastIndex(part, ":"); lindex != 0 {
-				switch part[lindex:] {
-				case ":int":
-					expr = "([0-9]+)"
-					part = part[:lindex]
-				case ":string":
-					expr = `([\w]+)`
-					part = part[:lindex]
-				}
-			}
-			params[j] = part
-			parts[i] = expr
-			j++
-		}
-		if strings.HasPrefix(part, "*") {
-			expr := "(.+)"
-			if part == "*.*" {
-				params[j] = ":path"
-				parts[i] = "([^.]+).([^.]+)"
-				j++
-				params[j] = ":ext"
-				j++
-			} else {
-				params[j] = ":splat"
-				parts[i] = expr
-				j++
-			}
-		}
+	regex, patt, err := ParseRoute(pattern)
+	if err != nil {
+		fmt.Println(err)
+		return
 	}
-	if j == 0 {
-		//now create the Route
-		t := reflect.Indirect(reflect.ValueOf(c)).Type()
-		route := &controllerInfo{}
-		route.pattern = pattern
-		route.controllerType = t
 
-		p.fixrouters = append(p.fixrouters, route)
-	} else { // add regexp routers
-		//recreate the url pattern, with parameters replaced
-		//by regular expressions. then compile the regex
-		pattern = strings.Join(parts, "/")
-		regex, regexErr := regexp.Compile(pattern)
-		if regexErr != nil {
-			//TODO add error handling here to avoid panic
-			panic(regexErr)
-			return
-		}
-
-		//now create the Route
-		t := reflect.Indirect(reflect.ValueOf(c)).Type()
-		route := &controllerInfo{}
-		route.regex = regex
-		route.params = params
-		route.pattern = pattern
-		route.controllerType = t
-		p.routers = append(p.routers, route)
-	}
+	//now create the Route
+	t := reflect.Indirect(reflect.ValueOf(c)).Type()
+	route := &controllerInfo{}
+	route.regex = regex
+	route.pattern = stringNilEmpty(patt)
+	route.controllerType = t
+	p.routers = append(p.routers, route)
 }
 
 func (p *ControllerRegistor) AddHandler(pattern string, c http.Handler) {
-	parts := strings.Split(pattern, "/")
 
-	j := 0
-	params := make(map[int]string)
-	for i, part := range parts {
-		if strings.HasPrefix(part, ":") {
-			expr := "([^/]+)"
-			//a user may choose to override the defult expression
-			// similar to expressjs: ‘/user/:id([0-9]+)’ 
-			if index := strings.Index(part, "("); index != -1 {
-				expr = part[index:]
-				part = part[:index]
-			}
-			params[j] = part
-			parts[i] = expr
-			j++
-		}
+	regex, patt, err := ParseRoute(pattern)
+	if err != nil {
+		fmt.Println(err)
+		return
 	}
-	if j == 0 {
-		//now create the Route
-		uh := &userHandler{}
-		uh.pattern = pattern
-		uh.h = c
-		p.userHandlers[pattern] = uh
-	} else { // add regexp routers
-		//recreate the url pattern, with parameters replaced
-		//by regular expressions. then compile the regex
-		pattern = strings.Join(parts, "/")
-		regex, regexErr := regexp.Compile(pattern)
-		if regexErr != nil {
-			//TODO add error handling here to avoid panic
-			panic(regexErr)
-			return
-		}
-
-		//now create the Route
-		uh := &userHandler{}
-		uh.regex = regex
-		uh.params = params
-		uh.pattern = pattern
-		uh.h = c
-		p.userHandlers[pattern] = uh
-	}
+	//now create the Route
+	uh := &userHandler{}
+	uh.regex = regex
+	uh.pattern = stringNilEmpty(patt)
+	uh.h = c
+	p.userHandlers[pattern] = uh
 }
 
 // Filter adds the middleware filter.
@@ -161,9 +71,6 @@ func (p *ControllerRegistor) Filter(filter http.HandlerFunc) {
 
 // FilterParam adds the middleware filter if the REST URL parameter exists.
 func (p *ControllerRegistor) FilterParam(param string, filter http.HandlerFunc) {
-	if !strings.HasPrefix(param, ":") {
-		param = ":" + param
-	}
 
 	p.Filter(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Query().Get(param)
@@ -186,17 +93,29 @@ func (p *ControllerRegistor) FilterPrefixPath(path string, filter http.HandlerFu
 func (p *ControllerRegistor) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	defer func() {
 		if err := recover(); err != nil {
-			if !RecoverPanic {
-				// go back to panic
-				panic(err)
+			errstr := fmt.Sprint(err)
+			if handler, ok := ErrorMaps[errstr]; ok {
+				handler(rw, r)
 			} else {
-				Critical("Handler crashed with error", err)
-				for i := 1; ; i += 1 {
-					_, file, line, ok := runtime.Caller(i)
-					if !ok {
-						break
+				if !RecoverPanic {
+					// go back to panic
+					panic(err)
+				} else {
+					var stack string
+					Critical("Handler crashed with error", err)
+					for i := 1; ; i++ {
+						_, file, line, ok := runtime.Caller(i)
+						if !ok {
+							break
+						}
+						Critical(file, line)
+						if RunMode == "dev" {
+							stack = stack + fmt.Sprintln(file, line)
+						}
 					}
-					Critical(file, line)
+					if RunMode == "dev" {
+						ShowErr(err, rw, r, stack)
+					}
 				}
 			}
 		}
@@ -204,12 +123,16 @@ func (p *ControllerRegistor) ServeHTTP(rw http.ResponseWriter, r *http.Request) 
 	w := &responseWriter{writer: rw}
 
 	var runrouter *controllerInfo
-	var findrouter bool
-
-	params := make(map[string]string)
+	params := url.Values{}
 
 	//static file server
 	for prefix, staticDir := range StaticDir {
+		if r.URL.Path == "/favicon.ico" {
+			file := staticDir + r.URL.Path
+			http.ServeFile(w, r, file)
+			w.started = true
+			return
+		}
 		if strings.HasPrefix(r.URL.Path, prefix) {
 			file := staticDir + r.URL.Path[len(prefix):]
 			http.ServeFile(w, r, file)
@@ -219,6 +142,7 @@ func (p *ControllerRegistor) ServeHTTP(rw http.ResponseWriter, r *http.Request) 
 	}
 
 	requestPath := r.URL.Path
+	r.ParseMultipartForm(MaxMemory)
 
 	//user defined Handler
 	for pattern, c := range p.userHandlers {
@@ -229,87 +153,56 @@ func (p *ControllerRegistor) ServeHTTP(rw http.ResponseWriter, r *http.Request) 
 			continue
 		}
 
-		//check if Route pattern matches url
-		if !c.regex.MatchString(requestPath) {
-			continue
-		}
-
-		//get submatches (params)
-		matches := c.regex.FindStringSubmatch(requestPath)
-
-		//double check that the Route matches the URL pattern.
-		if len(matches[0]) != len(requestPath) {
-			continue
-		}
-
-		if len(c.params) > 0 {
-			//add url parameters to the query param map
-			values := r.URL.Query()
-			for i, match := range matches[1:] {
-				values.Add(c.params[i], match)
-				params[c.params[i]] = match
+		if params, ok := NamedUrlValuesRegexpGroup(requestPath, c.regex); ok {
+			if len(params) > 0 {
+				values := r.URL.Query()
+				for k, vals := range params {
+					for _, v := range vals {
+						values.Add(k, v)
+						r.Form.Add(k, v)
+					}
+				}
+				//println(r.URL.RawQuery)
+				////reassemble query params and add to RawQuery
+				//println(values.Encode())
+				//println(r.URL.RawQuery)
+				r.URL.RawQuery = url.Values(values).Encode() + "&" + r.URL.RawQuery
 			}
-			//reassemble query params and add to RawQuery
-			r.URL.RawQuery = url.Values(values).Encode() + "&" + r.URL.RawQuery
-			//r.URL.RawQuery = url.Values(values).Encode()
+
+			c.h.ServeHTTP(rw, r)
+			return
 		}
-		c.h.ServeHTTP(rw, r)
-		return
 	}
 
 	//first find path from the fixrouters to Improve Performance
-	for _, route := range p.fixrouters {
-		n := len(requestPath)
-		//route like "/"
-		if n == 1 {
-			if requestPath == route.pattern {
+	for _, route := range p.routers {
+		if route.regex == nil {
+			if len(requestPath) == len(route.pattern) && requestPath == route.pattern {
 				runrouter = route
-				findrouter = true
 				break
-			} else {
-				continue
 			}
+			continue
 		}
 
-		if (requestPath[n-1] != '/' && route.pattern == requestPath) ||
-			(requestPath[n-1] == '/' && len(route.pattern) >= n-1 && requestPath[0:n-1] == route.pattern) {
+		if params, ok := NamedUrlValuesRegexpGroup(requestPath, route.regex); ok {
+			println(requestPath, route.regex.String(), len(params), route.controllerType.Name())
 			runrouter = route
-			findrouter = true
-			break
-		}
-	}
-
-	if !findrouter {
-		//find a matching Route
-		for _, route := range p.routers {
-
-			//check if Route pattern matches url
-			if !route.regex.MatchString(requestPath) {
-				continue
-			}
-
-			//get submatches (params)
-			matches := route.regex.FindStringSubmatch(requestPath)
-
-			//double check that the Route matches the URL pattern.
-			if len(matches[0]) != len(requestPath) {
-				continue
-			}
-
-			if len(route.params) > 0 {
-				//add url parameters to the query param map
+			if len(params) > 0 {
 				values := r.URL.Query()
-				for i, match := range matches[1:] {
-					values.Add(route.params[i], match)
-					params[route.params[i]] = match
+				for k, vals := range params {
+					for _, v := range vals {
+						values.Add(k, v)
+						r.Form.Add(k, v)
+					}
 				}
-				//reassemble query params and add to RawQuery
+				//println("r.URL.RawQuery=",r.URL.RawQuery)
+				////reassemble query params and add to RawQuery
+				//println("values.Encode()=",values.Encode())
+				//println("r.URL.RawQuery",r.URL.RawQuery)
+				//r.URL.RawQuery = params.Encode()
 				r.URL.RawQuery = url.Values(values).Encode() + "&" + r.URL.RawQuery
-				//r.URL.RawQuery = url.Values(values).Encode()
+				break
 			}
-			runrouter = route
-			findrouter = true
-			break
 		}
 	}
 
@@ -342,17 +235,17 @@ func (p *ControllerRegistor) ServeHTTP(rw http.ResponseWriter, r *http.Request) 
 			if r.Method == "GET" {
 				method = vc.MethodByName("Get")
 				method.Call(in)
-			} else if r.Method == "POST" {
-				method = vc.MethodByName("Post")
-				method.Call(in)
 			} else if r.Method == "HEAD" {
 				method = vc.MethodByName("Head")
 				method.Call(in)
-			} else if r.Method == "DELETE" {
+			} else if r.Method == "DELETE" || (r.Method == "POST" && r.Form.Get("_method") == "delete") {
 				method = vc.MethodByName("Delete")
 				method.Call(in)
-			} else if r.Method == "PUT" {
+			} else if r.Method == "PUT" || (r.Method == "POST" && r.Form.Get("_method") == "put") {
 				method = vc.MethodByName("Put")
+				method.Call(in)
+			} else if r.Method == "POST" {
+				method = vc.MethodByName("Post")
 				method.Call(in)
 			} else if r.Method == "PATCH" {
 				method = vc.MethodByName("Patch")
@@ -372,11 +265,17 @@ func (p *ControllerRegistor) ServeHTTP(rw http.ResponseWriter, r *http.Request) 
 				}
 			}
 		}
+		method = vc.MethodByName("Destructor")
+		method.Call(in)
 	}
 
 	//if no matches to url, throw a not found exception
 	if w.started == false {
-		http.NotFound(w, r)
+		if h, ok := ErrorMaps["404"]; ok {
+			h(w, r)
+		} else {
+			http.NotFound(w, r)
+		}
 	}
 }
 
@@ -406,4 +305,126 @@ func (w *responseWriter) WriteHeader(code int) {
 	w.status = code
 	w.started = true
 	w.writer.WriteHeader(code)
+}
+
+const (
+	PATTERN = `{<(?P<name>[A-Za-z_]+[A-Za-z_0-9]*)(\((?P<pattern>[^/<>]+)\))?>}`
+	EMPTY   = "[^/]*"
+)
+
+//解析键值对失败产生恐慌
+func replacement(s string) string {
+	pair, matched := ParamKeyValuePatternPair(s)
+	if matched {
+		switch pair.Pattern {
+		case "int":
+			pair.Pattern = `\d+`
+		case "string":
+			pair.Pattern = `\w+`
+		}
+		//fmt.Println(s,"==>",pair.Name,"###",pair.Pattern)
+		return `(?P<` + pair.Name + `>` + pair.Pattern + `)`
+	}
+	panic(fmt.Sprintf("片段'%s'无法匹配'%s'", s, PATTERN))
+}
+
+func ParseRoute(route string) (*regexp.Regexp, *string, error) {
+	defer func() { //必须要先声明defer，否则不能捕获到panic异常
+		if err := recover(); err != nil {
+			fmt.Println(err) //这里的err其实就是panic传入的内容
+		}
+	}()
+	re, err := regexp.Compile(PATTERN)
+	if err != nil {
+		return nil, nil, err
+	}
+	actual := re.ReplaceAllStringFunc(route, replacement) //这里可能产生panic
+	if actual == route {
+		return nil, &route, nil
+	}
+	reg, err := regexp.Compile("^" + actual + "$")
+	if err != nil {
+		return nil, nil, err
+	}
+	return reg, nil, nil
+}
+
+type ParamPair struct {
+	Name    string
+	Pattern string
+}
+
+// match regexp with string, and return a named group map
+// Example: ParamKeyValuePatternPair
+//   string: ":id(\\d+)"
+//   return: ParamPair{ Name:"id", Pattern:"\\d+" }
+func ParamKeyValuePatternPair(str string) (pair ParamPair, matched bool) {
+	reg, _ := regexp.Compile(PATTERN)
+	rst := reg.FindStringSubmatch(str)
+	length := len(rst)
+	if length < 3 {
+		return
+	}
+	sn := reg.SubexpNames()
+	if len(sn) < 3 {
+		return
+	}
+	nameIdx, patternIdx := 0, 0
+	for i := 0; i < len(sn) && i < length && nameIdx*patternIdx == 0; i++ {
+		if sn[i] == "name" {
+			nameIdx = i
+		} else if sn[i] == "pattern" {
+			patternIdx = i
+		}
+	}
+
+	if nameIdx*patternIdx == 0 {
+		return
+	}
+
+	pair = ParamPair{Name: rst[nameIdx], Pattern: rst[patternIdx]}
+	if pair.Pattern == "" {
+		pair.Pattern = EMPTY
+	}
+	matched = true
+	return
+}
+
+// match regexp with string, and return a named group map
+// Example:
+//   regexp: "(?P<name>[A-Za-z]+)-(?P<age>\\d+)"
+//   string: "CGC-30"
+//   return: map[string][]string{ "name":["CGC"], "age":["30"] }
+func NamedUrlValuesRegexpGroup(str string, reg *regexp.Regexp) (ng url.Values, matched bool) {
+	rst := reg.FindStringSubmatch(str)
+	if len(rst) < 1 {
+		return
+	}
+	//for i,s :=range rst{
+	//	fmt.Printf("%d => %s\n",i,s)
+	//}
+	ng = url.Values{}
+	lenRst := len(rst)
+	sn := reg.SubexpNames()
+	for k, v := range sn {
+		// SubexpNames contain the none named group,
+		// so must filter v == ""
+		//fmt.Printf("%s => %s\n",k,v)
+		if k == 0 || v == "" {
+			continue
+		}
+		if k+1 > lenRst {
+			break
+		}
+		ng.Add(v, rst[k])
+	}
+	matched = true
+	return
+}
+
+func stringNilEmpty(s *string) string {
+	if s != nil {
+		return *s
+	}
+	return ""
 }

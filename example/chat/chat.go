@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"github.com/astaxie/beego"
+	"github.com/xgene/beego"
 	"github.com/fzzy/sockjs-go/sockjs"
 	"strings"
 )
@@ -37,6 +37,6 @@ func main() {
 	conf := sockjs.NewConfig()
 	sockjshandler := sockjs.NewHandler("/chat", chatHandler, conf)
 	beego.Router("/", &MainController{})
-	beego.RouterHandler("/chat/:info(.*)", sockjshandler)
+	beego.RouterHandler("/chat/{<info(.*)>}", sockjshandler)
 	beego.Run()
 }
