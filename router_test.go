@@ -224,17 +224,17 @@ func Test_reg(t *testing.T){
 	if err!=nil {
 		t.Fail()
 	}
-	
+
 	b:=reg.MatchString("/admin/editblog/2")
-	
+
 	if !b {
 		t.Fail()
 	}
 	vals,ok := NamedUrlValuesRegexpGroup("/admin/editblog/2", reg)
-	
+
 	if !ok {
 		t.Fail()
 	}
-	
+
 	fmt.Println(vals)
 }
